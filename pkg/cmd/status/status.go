@@ -295,7 +295,10 @@ func (s *StatusGetter) LoadNotifications() error {
 				preview:    actual,
 			})
 		} else if err != nil {
-			return fmt.Errorf("could not fetch comment: %w", err)
+			var httpErr api.HTTPError
+			if !errors.As(err, &httpErr) || httpErr.StatusCode != 403 {
+				return fmt.Errorf("could not fetch comment: %w", err)
+			}
 		}
 	}
 
@@ -381,7 +384,13 @@ func (s *StatusGetter) LoadSearchResults() error {
 	}
 	err := c.GraphQL(s.hostname(), q, nil, &resp)
 	if err != nil {
-		return fmt.Errorf("could not search for assignments: %w", err)
+		// Exclude any FORBIDDEN errors and show status for what we can.
+		if gqlErrResponse, ok := err.(*api.GraphQLErrorResponse); ok {
+			err = filterGraphQLErrors(gqlErrResponse)
+		}
+		if err != nil {
+			return fmt.Errorf("could not search for assignments: %w", err)
+		}
 	}
 
 	prs := []SearchResult{}
@@ -393,13 +402,16 @@ func (s *StatusGetter) LoadSearchResults() error {
 			issues = append(issues, e.Node)
 		} else if e.Node.Type == "PullRequest" {
 			prs = append(prs, e.Node)
-		} else {
+		} else if e.Node.Type != "" {
+			// FORBIDDEN nodes are null in response, so Type == "" here.
 			panic("you shouldn't be here")
 		}
 	}
 
 	for _, e := range resp.ReviewRequested.Edges {
-		reviewRequested = append(reviewRequested, e.Node)
+		if e.Node.Type != "" {
+			reviewRequested = append(reviewRequested, e.Node)
+		}
 	}
 
 	sort.Sort(Results(issues))
@@ -434,6 +446,19 @@ func (s *StatusGetter) LoadSearchResults() error {
 		})
 	}
 
+	return nil
+}
+
+func filterGraphQLErrors(gqlErrResponse *api.GraphQLErrorResponse) error {
+	gqlErrors := make([]api.GraphQLError, 0, len(gqlErrResponse.Errors))
+	for _, gqlErr := range gqlErrResponse.Errors {
+		if gqlErr.Type != "FORBIDDEN" {
+			gqlErrors = append(gqlErrors, gqlErr)
+		}
+	}
+	if len(gqlErrors) > 0 {
+		return &api.GraphQLErrorResponse{Errors: gqlErrors}
+	}
 	return nil
 }
 
@@ -557,10 +582,10 @@ func statusRun(opts *StatusOptions) error {
 	})
 
 	err = g.Wait()
+	opts.IO.StopProgressIndicator()
 	if err != nil {
 		return err
 	}
-	opts.IO.StopProgressIndicator()
 
 	cs := opts.IO.ColorScheme()
 	out := opts.IO.Out
